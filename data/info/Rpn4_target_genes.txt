@@ -1,0 +1,45 @@
+# Rpn4 regulon (proteasome / ubiquitin–proteasome pathway)
+# Curated core targets (PACE motif–enriched, literature-supported)
+
+# 20S core proteasome
+PRE1
+PRE2
+PRE3
+PRE4
+PRE5
+PRE6
+PRT1
+PUP1
+PUP3
+
+# 19S regulatory particle – non-ATPase
+RPN1
+RPN2
+RPN3
+RPN5
+RPN6
+RPN7
+RPN8
+RPN9
+RPN10
+RPN11
+RPN12
+
+# 19S regulatory particle – ATPase
+RPT1
+RPT2
+RPT3
+RPT4
+RPT5
+RPT6
+
+# Proteasome-associated / ubiquitin pathway
+UBP6
+SEM1
+UBI4
+RAD23
+DDI1
+CUE1
+UFD1
+NPL4
+CDC48
