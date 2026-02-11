@@ -1,0 +1,399 @@
+---
+title: "Binary Hierarchical Silhouette Clustering of Yeast Heat Stress Transcriptomes"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+    fig_width: 10
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.retina = 2, dpi = 150
+)
+project_root <- normalizePath(file.path(dirname(
+  knitr::current_input(dir = TRUE)
+), ".."))
+```
+
+## Motivation
+
+Standard clustering methods (k-means, hierarchical agglomerative) require
+choosing the number of clusters *a priori* or applying an arbitrary
+tree-cut threshold.
+Both choices inject analyst judgment into what should be a data-driven
+step, and neither naturally produces clusters at multiple resolutions.
+
+**Binary Hierarchical Silhouette (BHS) clustering** sidesteps this by
+letting the data decide.
+It recursively bisects a dataset with k-means ($k{=}2$), accepting each
+split only when the mean silhouette score exceeds a user-specified
+threshold---a single, interpretable parameter that controls the minimum
+acceptable separation between child clusters.
+Recursion halts when no further split meets the criterion, yielding a
+variable number of clusters at varying depths in a binary tree.
+
+This procedure has two attractive properties for expression data:
+
+1. **Adaptive resolution.** Dense, well-separated groups are split many
+   times; diffuse continua are left whole.
+2. **Hierarchical labels.** Each leaf cluster carries a path
+   (e.g., `L.R.L`) that encodes its ancestry, so relationships between
+   clusters are transparent.
+
+We apply BHS to rank-transformed, baseline-subtracted expression data
+from a yeast heat stress time course (SK1 strain, 35--46 &deg;C,
+5--120 min).
+
+## Data preparation
+
+Expression ranks (1 = highest TPM in each condition) were computed
+within each of 37 temperature &times; time combinations.
+The 30 &deg;C / 15 min sample serves as the baseline: its rank vector
+is subtracted from every other condition, and then the baseline column is
+dropped, leaving a 6,669-gene &times; 36-condition matrix.
+Each gene's vector is then median-centred so that the clustering captures
+*shape*, not offset.
+
+```{r load-data}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(scales)
+library(jsonlite)
+library(ggraph)
+library(tidygraph)
+library(gt)
+
+clusters <- read_tsv(file.path(project_root, "results", "bhs_clusters.tsv"),
+                     show_col_types = FALSE)
+tpm      <- read_csv(file.path(project_root, "data", "processed",
+                                "SK1_tidy_TPM.csv"),
+                     show_col_types = FALSE)
+meta     <- fromJSON(file.path(project_root, "data", "processed",
+                                "rank_vectors_meta.json"))
+
+# Gene categories from the annotated TPM matrix
+cats <- read_csv(
+  file.path(project_root, "data", "processed",
+            "yeast_ORF_TPM_matrix_labeled_with_categories.csv"),
+  show_col_types = FALSE
+) |>
+  select(systematic_name, common_name, gene_category)
+
+# Additional gene lists
+ribi <- readLines(file.path(project_root, "data", "info", "ribi_genes.txt"))
+rpn4 <- readLines(file.path(project_root, "data", "info", "Rpn4_target_genes.txt"))
+rpn4 <- rpn4[!grepl("^#|^$", rpn4)]
+gcn4 <- readLines(file.path(project_root, "data", "info", "gcn4_target_genes.txt"))
+sum1 <- readLines(file.path(project_root, "data", "info", "sum1_target_genes.txt"))
+
+# Merge cluster assignments with annotations
+clust <- clusters |>
+  left_join(cats, by = "systematic_name")
+```
+
+## Algorithm
+
+```
+BHS(X, threshold):
+    if |X| < min_size or depth > max_depth:
+        return leaf
+    labels <- k-means(X, k = 2)
+    s <- mean silhouette(X, labels)
+    if s > threshold:
+        BHS(X[labels == 0], threshold)
+        BHS(X[labels == 1], threshold)
+    else:
+        return leaf
+```
+
+**Parameters used:** `silhouette_threshold = 0.20`,
+`min_cluster_size = 10`, `max_depth = 20`, `random_state = 42`.
+
+## Results
+
+### Cluster inventory
+
+```{r enrichment-calc}
+# --- Enrichment: gene_category terms ------------------------------------
+enrich_cat <- clust |>
+  filter(gene_category != "other") |>
+  count(cluster_id, gene_category, name = "k") |>
+  left_join(clust |> count(cluster_id, name = "n_cluster"),
+            by = "cluster_id") |>
+  mutate(
+    K = sapply(gene_category, \(gc) sum(clust$gene_category == gc)),
+    N = nrow(clust),
+    fold = (k / n_cluster) / (K / N),
+    pval = mapply(\(k, n, K, N) {
+      fisher.test(matrix(c(k, n - k, K - k, N - K - n + k), 2, 2),
+                  alternative = "greater")$p.value
+    }, k, n_cluster, K, N)
+  )
+
+# --- Enrichment: additional gene-list terms ------------------------------
+test_list <- function(gene_vec, label) {
+  clust |>
+    mutate(hit = common_name %in% gene_vec) |>
+    group_by(cluster_id) |>
+    summarise(k = sum(hit), n_cluster = n(), .groups = "drop") |>
+    filter(k > 0) |>
+    mutate(
+      gene_category = label,
+      K = sum(clust$common_name %in% gene_vec),
+      N = nrow(clust),
+      fold = (k / n_cluster) / (K / N),
+      pval = mapply(\(k, n, K, N) {
+        fisher.test(matrix(c(k, n - k, K - k, N - K - n + k), 2, 2),
+                    alternative = "greater")$p.value
+      }, k, n_cluster, K, N)
+    )
+}
+
+enrich_extra <- bind_rows(
+  test_list(rpn4, "Rpn4 target"),
+  test_list(gcn4, "Gcn4 target"),
+  test_list(sum1, "Sum1 target")
+)
+
+# --- Combine and pick top enrichment per cluster ------------------------
+all_enrich <- bind_rows(enrich_cat, enrich_extra) |>
+  filter(pval < 0.05) |>
+  group_by(cluster_id) |>
+  slice_min(pval, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+cluster_summary <- clust |>
+  count(cluster_id, name = "n") |>
+  arrange(cluster_id) |>
+  left_join(all_enrich |> select(cluster_id, enrichment = gene_category,
+                                  fold, pval),
+            by = "cluster_id") |>
+  mutate(
+    depth = nchar(gsub("[^.]", "", cluster_id)) + 1L,
+    enrichment = coalesce(enrichment, "---")
+  )
+```
+
+```{r cluster-table}
+cluster_summary |>
+  mutate(
+    p_fmt  = ifelse(enrichment == "---", "", formatC(pval, format = "e", digits = 1)),
+    fold_fmt = ifelse(enrichment == "---", "", sprintf("%.1fx", fold))
+  ) |>
+  select(Cluster = cluster_id, N = n, Depth = depth,
+         `Top enrichment` = enrichment,
+         Fold = fold_fmt, p = p_fmt) |>
+  gt() |>
+  tab_header(
+    title = "BHS cluster inventory",
+    subtitle = "15 leaf clusters, threshold = 0.20"
+  ) |>
+  cols_align(align = "right", columns = c(N, Depth)) |>
+  cols_align(align = "left", columns = c(Cluster, `Top enrichment`))
+```
+
+### Figure 1: Cluster map
+
+Clusters are positioned by a force-directed layout of the binary tree.
+Circle area is proportional to cluster size; colour indicates the top
+enrichment (Fisher's exact, $p < 0.05$).
+
+```{r build-tree}
+# --- Reconstruct the full binary tree from leaf paths --------------------
+leaf_paths <- sort(unique(cluster_summary$cluster_id))
+
+all_nodes <- "ROOT"
+for (p in leaf_paths) {
+  parts <- strsplit(p, "\\.")[[1]]
+  for (i in seq_along(parts))
+    all_nodes <- c(all_nodes, paste(parts[1:i], collapse = "."))
+}
+all_nodes <- unique(all_nodes)
+
+edges <- do.call(rbind, lapply(setdiff(all_nodes, "ROOT"), \(node) {
+  parts  <- strsplit(node, "\\.")[[1]]
+  parent <- if (length(parts) == 1) "ROOT" else paste(parts[-length(parts)], collapse = ".")
+  data.frame(from = parent, to = node)
+}))
+
+# Node attributes
+node_df <- data.frame(name = all_nodes, stringsAsFactors = FALSE) |>
+  left_join(cluster_summary |> select(cluster_id, n, enrichment),
+            by = c("name" = "cluster_id")) |>
+  mutate(is_leaf = name %in% leaf_paths)
+
+# Propagate sizes to internal nodes
+for (i in seq_len(nrow(node_df))) {
+  if (is.na(node_df$n[i])) {
+    descs <- leaf_paths[startsWith(leaf_paths, paste0(node_df$name[i], ".")) |
+                          leaf_paths == node_df$name[i]]
+    node_df$n[i] <- sum(cluster_summary$n[cluster_summary$cluster_id %in% descs])
+  }
+}
+node_df$enrichment[is.na(node_df$enrichment)] <- ""
+
+# Silhouette scores at internal (split) nodes
+sil_scores <- c(
+  ROOT = 0.248, L = 0.399, L.L = 0.314, L.R = 0.205,
+  L.R.L = 0.228, L.R.L.L = 0.215, L.R.L.L.L = 0.230,
+  L.R.L.L.L.L = 0.254, L.R.L.L.L.L.R = 0.323,
+  L.R.L.L.R = 0.249, L.R.L.R = 0.233, L.R.R = 0.212,
+  R = 0.286, R.L = 0.300
+)
+node_df$silhouette <- sil_scores[node_df$name]
+
+# Colour palette
+enrich_levels  <- c("Hsf1 target", "Msn2 target", "Hac1 target",
+                    "RPG", "RiBi gene", "Rpn4 target", "Gcn4 target", "---")
+enrich_colours <- c(
+  "Hsf1 target" = "#d62728", "Msn2 target" = "#ff7f0e",
+  "Hac1 target" = "#9467bd", "RPG" = "#1f77b4",
+  "RiBi gene"   = "#2ca02c", "Rpn4 target" = "#e377c2",
+  "Gcn4 target" = "#8c564b", "---" = "grey70"
+)
+```
+
+```{r cluster-map, fig.width=10, fig.height=8}
+g <- tbl_graph(nodes = node_df, edges = edges, directed = TRUE)
+
+set.seed(42)
+p_map <- ggraph(g, layout = "stress") +
+  geom_edge_link(colour = "grey80", width = 0.3) +
+  geom_node_point(aes(filter = !is_leaf), colour = "grey60", size = 1.5) +
+  geom_node_point(aes(filter = is_leaf, size = n, colour = enrichment)) +
+  geom_node_text(
+    aes(filter = is_leaf, label = paste0(name, "\nn=", n)),
+    size = 2.5, vjust = -1.2, lineheight = 0.85
+  ) +
+  scale_size_area(max_size = 30, guide = "none") +
+  scale_colour_manual(values = enrich_colours, breaks = enrich_levels,
+                      name = "Top enrichment") +
+  theme_void() +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5)) +
+  labs(title = "BHS cluster map")
+
+p_map
+```
+
+### Figure 2: Split tree
+
+The binary split tree from root to leaves.
+Node size reflects membership count; silhouette scores annotate each
+accepted split.
+
+```{r split-tree, fig.width=11, fig.height=7}
+node_df2 <- node_df |>
+  mutate(
+    node_label = ifelse(is_leaf,
+                        paste0(name, "\n(", n, ")"),
+                        paste0(name, "\n(", n, ")")),
+    sil_label  = ifelse(!is.na(silhouette),
+                        sprintf("s=%.2f", silhouette), NA_character_)
+  )
+
+g2 <- tbl_graph(nodes = node_df2, edges = edges, directed = TRUE)
+
+p_tree <- ggraph(g2, layout = "tree", circular = FALSE) +
+  geom_edge_diagonal(colour = "grey50", width = 0.4) +
+  geom_node_point(
+    aes(size = n,
+        colour = ifelse(is_leaf, enrichment, "internal"))
+  ) +
+  geom_node_text(aes(label = node_label),
+                 size = 2.0, vjust = -0.8, lineheight = 0.85) +
+  geom_node_text(
+    aes(filter = !is.na(sil_label), label = sil_label),
+    size = 2.0, vjust = 1.8, colour = "grey40", fontface = "italic"
+  ) +
+  scale_size_area(max_size = 20, guide = "none") +
+  scale_colour_manual(
+    values = c(enrich_colours, internal = "grey50"),
+    breaks = enrich_levels, name = "Top enrichment"
+  ) +
+  theme_void() +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5)) +
+  labs(title = "BHS split tree (silhouette scores at internal nodes)")
+
+p_tree
+```
+
+### Enrichment heatmap
+
+Fold-enrichment of known regulon gene sets across all 15 clusters.
+Cell values show the number of genes from the regulon present in the
+cluster; significance stars indicate BH-adjusted Fisher's exact
+$p$-values.
+
+```{r enrichment-heatmap, fig.width=10, fig.height=7}
+# Full enrichment matrix: all terms x all clusters
+enrich_full <- bind_rows(enrich_cat, enrich_extra) |>
+  mutate(padj = p.adjust(pval, method = "BH"),
+         sig  = case_when(padj < 0.001 ~ "***",
+                          padj < 0.01  ~ "**",
+                          padj < 0.05  ~ "*",
+                          TRUE ~ ""),
+         fold_cap = pmin(fold, 15))
+
+ggplot(enrich_full, aes(x = gene_category, y = cluster_id)) +
+  geom_tile(aes(fill = fold_cap), colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = paste0(k, sig)), size = 2.8) +
+  scale_fill_gradient2(
+    low = "white", mid = "lightyellow", high = "firebrick",
+    midpoint = 2, limits = c(0, 15), name = "Fold enrichment",
+    oob = squish
+  ) +
+  scale_x_discrete(position = "top") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0, size = 9),
+    axis.text.y = element_text(family = "mono", size = 8),
+    panel.grid  = element_blank(),
+    plot.title  = element_text(size = 13, face = "bold")
+  ) +
+  labs(
+    title = "Cluster enrichment for known regulons",
+    subtitle = paste0("Cell values: gene count; ",
+                      "* p<0.05, ** p<0.01, *** p<0.001 (BH-adjusted)"),
+    x = NULL, y = "Cluster"
+  )
+```
+
+## Discussion
+
+BHS clustering with a threshold of 0.20 yields 15 clusters that
+capture biologically coherent transcriptional programmes:
+
+- **Ribosomal protein genes** (RPG) and **ribosome biogenesis genes**
+  (RiBi) separate into distinct clusters on the L branch, consistent
+  with their known co-regulation but distinct regulatory logic
+  (Sfp1/Ifh1 for RPGs vs several factors for RiBi).
+
+- **Heat shock genes** split between constitutive chaperones
+  (SSA1/SSA2/HSP82, in the large L.L.R cluster) and
+  stress-inducible chaperones (HSP104/SSA3/SSA4, in R.L), reflecting
+  their different Hsf1- vs Msn2/4-driven regulation.
+
+- **Msn2 targets** concentrate in R.L.R, consistent with a distinct
+  general stress response programme that diverges from the Hsf1
+  programme at the first split.
+
+The hierarchical labels make the relationships between these programmes
+transparent: L vs R captures the fundamental division between
+genes whose rank is relatively stable (L, 4,472 genes) versus those
+that undergo large rank shifts under heat stress (R, 2,197 genes).
+
+The BHS tool (`tools/python/bhs.py`) is fully general and can be
+applied to any feature matrix.  The only domain-specific step is the
+choice of input representation---here, baseline-subtracted,
+median-centred expression ranks.
